@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build do executavel (gerado pelo gerar_exe.bat)
+dist/
+build/
+*.spec
