@@ -35,14 +35,29 @@ def _get_engine():
     return _engine
 
 
-async def _recognize(img):
+async def _ocr(img):
     rgba = img.convert("RGBA")
     writer = DataWriter()
     writer.write_bytes(rgba.tobytes("raw", "BGRA"))
     bitmap = SoftwareBitmap.create_copy_from_buffer(
         writer.detach_buffer(), BitmapPixelFormat.BGRA8, rgba.width, rgba.height)
-    result = await _get_engine().recognize_async(bitmap)
+    return await _get_engine().recognize_async(bitmap)
+
+
+async def _recognize(img):
+    result = await _ocr(img)
     return [w.text for line in result.lines for w in line.words]
+
+
+def read_text(img, max_size=2400):
+    """Texto da página (uma linha do OCR por linha). Vazio se o OCR não estiver disponível."""
+    if not OCR_AVAILABLE or _get_engine() is None:
+        return ""
+    gray = img.convert("L")
+    limit = min(max_size, OcrEngine.max_image_dimension)
+    gray.thumbnail((limit, limit))
+    result = asyncio.run(_ocr(gray))
+    return "\n".join(line.text for line in result.lines)
 
 
 def _score(words):

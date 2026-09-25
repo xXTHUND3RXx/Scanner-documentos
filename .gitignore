@@ -6,3 +6,13 @@ __pycache__/
 dist/
 build/
 *.spec
+
+# Documentos digitalizados (dados sensiveis: nunca enviar ao GitHub)
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.bmp
+exemplos/

@@ -24,6 +24,7 @@ import img2pdf
 from orientacao import detect_rotation, OCR_AVAILABLE
 import monitor as M
 import escl
+import recibos as R
 
 APP_NAME = "Escanner em Lote"
 DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "EscannerLote")
@@ -90,6 +91,9 @@ ESCL_COLORS = {  # no P&B pedimos cinza e convertemos aqui, com limiar próprio 
     "Tons de cinza": "Grayscale8",
     "Preto e branco (texto)": "Grayscale8",
 }
+FORMAT_SINGLE = "PDF (um arquivo)"
+FORMAT_SPLIT = "PDF separado (um por página)"
+FORMAT_IMAGES = "Imagens (JPG/PNG)"
 NETWORK_SUFFIX = " — pela rede (recomendado)"
 RESOLUTIONS = ["150", "200", "300", "400", "600"]
 PAPERS = {  # polegadas (largura, altura)
@@ -202,6 +206,7 @@ def rotate_file(path, angle):
     if path.lower().endswith(".jpg"):
         kwargs["quality"] = 90
     rotated.save(path, **kwargs)
+    R.forget_text(path)
 
 
 def process_page(raw, settings, dpi, datatype):
@@ -215,6 +220,7 @@ def process_page(raw, settings, dpi, datatype):
         angle = detect_rotation(im)
         if angle:
             im = im.rotate(angle, expand=True)
+    ocr_img = im
     stamp = time.time_ns()
     if datatype == 0:
         out = os.path.join(SESSION_DIR, f"pag_{stamp}.png")
@@ -224,6 +230,11 @@ def process_page(raw, settings, dpi, datatype):
     else:
         out = os.path.join(SESSION_DIR, f"pag_{stamp}.jpg")
         im.convert("RGB" if datatype == 3 else "L").save(out, "JPEG", quality=85, dpi=(dpi, dpi))
+    if settings.get("read_text"):
+        try:
+            R.cache_text(out, ocr_img)
+        except Exception:
+            pass  # será lido de novo na hora de salvar
     return out
 
 
@@ -511,6 +522,7 @@ class App(tk.Tk):
             "printer_ip": self.ip_var.get().strip(),
             "printer_model": self.config_data.get("printer_model", ""),
             "format": self.format_var.get(),
+            "template": self.template_var.get(),
         }
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -646,16 +658,34 @@ class App(tk.Tk):
         bottom.pack(fill="x", pady=(10, 0))
         self.folder_var = tk.StringVar(value=cfg.get("folder", os.path.join(os.path.expanduser("~"), "Documents")))
         self.name_var = tk.StringVar(value=self.default_name())
-        self.format_var = tk.StringVar(value=cfg.get("format", "PDF (um arquivo)"))
+        self.template_var = tk.StringVar(value=cfg.get("template", R.DEFAULT_TEMPLATE))
+        fmt = cfg.get("format", FORMAT_SINGLE)
+        self.format_var = tk.StringVar(value=fmt if fmt in (FORMAT_SINGLE, FORMAT_SPLIT, FORMAT_IMAGES)
+                                       else FORMAT_SINGLE)
         ttk.Label(bottom, text="Pasta:").pack(side="left")
-        ttk.Entry(bottom, textvariable=self.folder_var, width=40).pack(side="left", padx=4)
+        ttk.Entry(bottom, textvariable=self.folder_var, width=32).pack(side="left", padx=4)
         ttk.Button(bottom, text="Procurar...", command=self.choose_folder).pack(side="left")
-        ttk.Label(bottom, text="Nome:").pack(side="left", padx=(14, 4))
-        ttk.Entry(bottom, textvariable=self.name_var, width=30).pack(side="left")
-        ttk.Combobox(bottom, textvariable=self.format_var, state="readonly", width=18,
-                     values=["PDF (um arquivo)", "Imagens (JPG/PNG)"]).pack(side="left", padx=8)
+        format_box = ttk.Combobox(bottom, textvariable=self.format_var, state="readonly", width=27,
+                                  values=[FORMAT_SINGLE, FORMAT_SPLIT, FORMAT_IMAGES])
+        format_box.pack(side="left", padx=(14, 0))
+        format_box.bind("<<ComboboxSelected>>", self.on_format_change)
+        self.name_label = ttk.Label(bottom, text="Nome:")
+        self.name_label.pack(side="left", padx=(12, 4))
+        self.name_entry = ttk.Entry(bottom, textvariable=self.name_var, width=32)
+        self.name_entry.pack(side="left")
+        self.hint_label = ttk.Label(bottom, text="{RT} = nº da RT", foreground="#6c757d")
         self.save_btn = ttk.Button(bottom, text="💾  SALVAR", style="Save.TButton", command=self.save)
         self.save_btn.pack(side="right")
+        self.on_format_change()
+
+    def on_format_change(self, _event=None):
+        split = self.format_var.get() == FORMAT_SPLIT
+        self.name_label.configure(text="Modelo do nome:" if split else "Nome:")
+        self.name_entry.configure(textvariable=self.template_var if split else self.name_var)
+        if split:
+            self.hint_label.pack(side="left", padx=(6, 0), after=self.name_entry)
+        else:
+            self.hint_label.pack_forget()
 
     def default_name(self):
         return "Digitalizacao_" + datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -732,6 +762,8 @@ class App(tk.Tk):
             "paper": self.paper_var.get(),
             "skip_blank": self.blank_var.get(),
             "auto_rotate": self.rotate_var.get(),
+            "read_text": (self.format_var.get() == FORMAT_SPLIT and R.uses_rt(self.template_var.get())
+                          and OCR_AVAILABLE),
         }
         self.save_config()
         self.scanning = True
@@ -960,6 +992,7 @@ class App(tk.Tk):
             self.tiles.pop(path).destroy()
             self.thumbs.pop(path, None)
             self.selected.discard(path)
+            R.forget_text(path)
             try:
                 os.remove(path)
             except OSError:
@@ -1045,25 +1078,85 @@ class App(tk.Tk):
         if folder:
             self.folder_var.set(os.path.normpath(folder))
 
+    def valid_folder(self):
+        folder = self.folder_var.get().strip()
+        try:
+            os.makedirs(folder, exist_ok=True)
+            return folder
+        except OSError:
+            messagebox.showerror(APP_NAME, "Pasta inválida. Escolha outra pasta.")
+            return None
+
+    def set_busy(self, busy, message=None):
+        state = "disabled" if busy else "normal"
+        self.save_btn.configure(state=state)
+        self.scan_btn.configure(state=state)
+        if busy:
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+        if message:
+            self.status_var.set(message)
+
+    def run_background(self, work, on_done, progress_text=None):
+        """Executa work() em segundo plano e chama on_done(resultado, erro) ao terminar."""
+        result = {}
+
+        def wrapper():
+            try:
+                result["value"] = work()
+            except Exception as e:
+                result["error"] = str(e)
+
+        t = threading.Thread(target=wrapper, daemon=True)
+        t.start()
+
+        def check():
+            if t.is_alive():
+                if progress_text:
+                    self.status_var.set(progress_text())
+                self.after(150, check)
+                return
+            on_done(result.get("value"), result.get("error"))
+
+        check()
+
+    def finish_save(self, error, message, folder):
+        self.set_busy(False)
+        if error:
+            self.status_var.set("Erro ao salvar.")
+            messagebox.showerror(APP_NAME, f"Erro ao salvar:\n{error}")
+            return
+        self.status_var.set(message.splitlines()[0])
+        answer = messagebox.askyesnocancel(
+            APP_NAME, f"{message}\n\n"
+                      f"SIM = abrir a pasta e começar novo lote\n"
+                      f"NÃO = começar novo lote\n"
+                      f"CANCELAR = manter as páginas na tela")
+        if answer is not None:
+            if answer:
+                os.startfile(folder)
+            self.clear_all(ask=False)
+
     def save(self):
         if not self.pages:
             messagebox.showinfo(APP_NAME, "Não há páginas para salvar.")
             return
-        folder = self.folder_var.get().strip()
+        if self.format_var.get() == FORMAT_SPLIT:
+            self.save_split()
+            return
         name = self.name_var.get().strip()
         for ch in '<>:"/\\|?*':
             name = name.replace(ch, "_")
         if not name:
             messagebox.showwarning(APP_NAME, "Digite um nome para o arquivo.")
             return
-        try:
-            os.makedirs(folder, exist_ok=True)
-        except OSError:
-            messagebox.showerror(APP_NAME, "Pasta inválida. Escolha outra pasta.")
+        folder = self.valid_folder()
+        if not folder:
             return
         self.save_config()
         pages = list(self.pages)
-        as_pdf = self.format_var.get().startswith("PDF")
+        as_pdf = self.format_var.get() == FORMAT_SINGLE
         if as_pdf:
             target = os.path.join(folder, name + ".pdf")
             if os.path.exists(target) and not messagebox.askyesno(APP_NAME, f"O arquivo já existe:\n{target}\n\n"
@@ -1076,52 +1169,75 @@ class App(tk.Tk):
                                                  f"Escolha outro nome.")
                 return
 
-        self.save_btn.configure(state="disabled")
-        self.scan_btn.configure(state="disabled")
-        self.progress.start(12)
-        self.status_var.set(f"Salvando {len(pages)} página(s)...")
-        result = {}
-
         def work():
-            try:
-                if as_pdf:
-                    tmp = target + ".tmp"
-                    with open(tmp, "wb") as f:
-                        img2pdf.convert(pages, outputstream=f)
-                    os.replace(tmp, target)
-                else:
-                    os.makedirs(target, exist_ok=True)
-                    for i, p in enumerate(pages, 1):
-                        shutil.copy2(p, os.path.join(target, f"{name}_{i:04d}{os.path.splitext(p)[1]}"))
-            except Exception as e:
-                result["error"] = str(e)
+            if as_pdf:
+                tmp = target + ".tmp"
+                with open(tmp, "wb") as f:
+                    img2pdf.convert(pages, outputstream=f)
+                os.replace(tmp, target)
+            else:
+                os.makedirs(target, exist_ok=True)
+                for i, p in enumerate(pages, 1):
+                    shutil.copy2(p, os.path.join(target, f"{name}_{i:04d}{os.path.splitext(p)[1]}"))
 
-        t = threading.Thread(target=work, daemon=True)
-        t.start()
+        self.set_busy(True, f"Salvando {len(pages)} página(s)...")
+        self.run_background(work, lambda _v, err: self.finish_save(
+            err, f"{len(pages)} página(s) salvas com sucesso em:\n{target}", folder))
 
-        def check():
-            if t.is_alive():
-                self.after(150, check)
+    def save_split(self):
+        """Um PDF por página, com o nome montado pelo modelo (ex.: RECIBO DE INSUMO - RT {RT})."""
+        template = self.template_var.get().strip()
+        if not template:
+            messagebox.showwarning(APP_NAME, "Digite o modelo do nome dos arquivos.")
+            return
+        folder = self.valid_folder()
+        if not folder:
+            return
+        self.save_config()
+        pages = list(self.pages)
+        need_rt = R.uses_rt(template)
+        if need_rt and not OCR_AVAILABLE:
+            messagebox.showwarning(APP_NAME, "O reconhecimento de texto do Windows não está disponível.\n"
+                                             "Você poderá digitar os números na próxima tela.")
+        done = [0]
+
+        def read_all():
+            rts = []
+            for p in pages:
+                rt = None
+                if need_rt and OCR_AVAILABLE:
+                    try:
+                        rt = R.find_rt(R.page_text(p))
+                    except Exception:
+                        pass
+                rts.append(rt)
+                done[0] += 1
+            return rts
+
+        def review(rts, error):
+            self.set_busy(False, "Confira os nomes dos arquivos.")
+            if error:
+                messagebox.showerror(APP_NAME, f"Erro ao ler as páginas:\n{error}")
                 return
-            self.progress.stop()
-            self.save_btn.configure(state="normal")
-            self.scan_btn.configure(state="normal")
-            if "error" in result:
-                self.status_var.set("Erro ao salvar.")
-                messagebox.showerror(APP_NAME, f"Erro ao salvar:\n{result['error']}")
-                return
-            self.status_var.set(f"Salvo: {target}")
-            answer = messagebox.askyesnocancel(
-                APP_NAME, f"{len(pages)} página(s) salvas com sucesso em:\n{target}\n\n"
-                          f"SIM = abrir a pasta e começar novo lote\n"
-                          f"NÃO = começar novo lote\n"
-                          f"CANCELAR = manter as páginas na tela")
-            if answer is not None:
-                if answer:
-                    os.startfile(folder)
-                self.clear_all(ask=False)
+            R.ReviewDialog(self, pages, rts, template, folder,
+                           lambda names: self.write_split(pages, names, folder))
 
-        check()
+        self.set_busy(True, "Lendo o número da RT das páginas...")
+        self.run_background(read_all, review,
+                            lambda: f"Lendo o número da RT... {done[0]} de {len(pages)}")
+
+    def write_split(self, pages, names, folder):
+        def work():
+            for page, name in zip(pages, names):
+                target = os.path.join(folder, name + ".pdf")
+                tmp = target + ".tmp"
+                with open(tmp, "wb") as f:
+                    img2pdf.convert([page], outputstream=f)
+                os.replace(tmp, target)
+
+        self.set_busy(True, f"Salvando {len(pages)} PDF(s)...")
+        self.run_background(work, lambda _v, err: self.finish_save(
+            err, f"{len(pages)} PDF(s) salvos com sucesso em:\n{folder}", folder))
 
     def on_close(self):
         if self.scanning and not messagebox.askyesno(APP_NAME, "Uma digitalização está em andamento. Sair mesmo assim?"):
@@ -1154,6 +1270,7 @@ def self_test():
         return {a: detect_rotation(page.rotate(a, expand=True)) for a in (0, 90, 180, 270)}
 
     check("rotacao", ocr)
+    check("leitura RT", lambda: [R.find_rt(t) for t in ("RT: 4521", "R.T. nº 0098", "PARTE 3")])
 
     def pdf():
         import io
