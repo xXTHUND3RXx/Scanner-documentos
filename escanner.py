@@ -25,6 +25,8 @@ from orientacao import detect_rotation, OCR_AVAILABLE
 import monitor as M
 import escl
 import recibos as R
+from revisao import ReviewDialog
+from editor_modelos import ModelsDialog
 
 APP_NAME = "Escanner em Lote"
 DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "EscannerLote")
@@ -206,7 +208,7 @@ def rotate_file(path, angle):
     if path.lower().endswith(".jpg"):
         kwargs["quality"] = 90
     rotated.save(path, **kwargs)
-    R.forget_text(path)
+    R.forget_ocr(path)
 
 
 def process_page(raw, settings, dpi, datatype):
@@ -232,7 +234,7 @@ def process_page(raw, settings, dpi, datatype):
         im.convert("RGB" if datatype == 3 else "L").save(out, "JPEG", quality=85, dpi=(dpi, dpi))
     if settings.get("read_text"):
         try:
-            R.cache_text(out, ocr_img)
+            R.cache_ocr(out, ocr_img)
         except Exception:
             pass  # será lido de novo na hora de salvar
     return out
@@ -522,7 +524,7 @@ class App(tk.Tk):
             "printer_ip": self.ip_var.get().strip(),
             "printer_model": self.config_data.get("printer_model", ""),
             "format": self.format_var.get(),
-            "template": self.template_var.get(),
+            "doc_type": self.doctype_var.get(),
         }
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -656,14 +658,18 @@ class App(tk.Tk):
         # --- 3. Salvar
         bottom = ttk.LabelFrame(root, text=" 3. Salvar ", padding=10)
         bottom.pack(fill="x", pady=(10, 0))
-        self.folder_var = tk.StringVar(value=cfg.get("folder", os.path.join(os.path.expanduser("~"), "Documents")))
+        documents = os.path.join(os.path.expanduser("~"), "Documents")
+        last_folder = cfg.get("folder") or documents
+        self.folder_var = tk.StringVar(value=last_folder if os.path.isdir(last_folder) else documents)
         self.name_var = tk.StringVar(value=self.default_name())
-        self.template_var = tk.StringVar(value=cfg.get("template", R.DEFAULT_TEMPLATE))
+        self.doctype_var = tk.StringVar(value=cfg.get("doc_type", R.AUTO))
         fmt = cfg.get("format", FORMAT_SINGLE)
         self.format_var = tk.StringVar(value=fmt if fmt in (FORMAT_SINGLE, FORMAT_SPLIT, FORMAT_IMAGES)
                                        else FORMAT_SINGLE)
         ttk.Label(bottom, text="Pasta:").pack(side="left")
-        ttk.Entry(bottom, textvariable=self.folder_var, width=32).pack(side="left", padx=4)
+        folder_entry = ttk.Entry(bottom, textvariable=self.folder_var, width=32)
+        folder_entry.pack(side="left", padx=4)
+        folder_entry.bind("<FocusOut>", lambda e: self.save_config())
         ttk.Button(bottom, text="Procurar...", command=self.choose_folder).pack(side="left")
         format_box = ttk.Combobox(bottom, textvariable=self.format_var, state="readonly", width=27,
                                   values=[FORMAT_SINGLE, FORMAT_SPLIT, FORMAT_IMAGES])
@@ -673,19 +679,34 @@ class App(tk.Tk):
         self.name_label.pack(side="left", padx=(12, 4))
         self.name_entry = ttk.Entry(bottom, textvariable=self.name_var, width=32)
         self.name_entry.pack(side="left")
-        self.hint_label = ttk.Label(bottom, text="{RT} = nº da RT", foreground="#6c757d")
+        self.doctype_combo = ttk.Combobox(bottom, textvariable=self.doctype_var, state="readonly", width=26)
+        self.models_btn = ttk.Button(bottom, text="⚙ Modelos", command=self.open_models)
+        self.load_doc_types()
         self.save_btn = ttk.Button(bottom, text="💾  SALVAR", style="Save.TButton", command=self.save)
         self.save_btn.pack(side="right")
         self.on_format_change()
 
     def on_format_change(self, _event=None):
         split = self.format_var.get() == FORMAT_SPLIT
-        self.name_label.configure(text="Modelo do nome:" if split else "Nome:")
-        self.name_entry.configure(textvariable=self.template_var if split else self.name_var)
+        self.name_label.configure(text="Tipo:" if split else "Nome:")
         if split:
-            self.hint_label.pack(side="left", padx=(6, 0), after=self.name_entry)
+            self.name_entry.pack_forget()
+            self.doctype_combo.pack(side="left", after=self.name_label)
+            self.models_btn.pack(side="left", padx=(6, 0), after=self.doctype_combo)
         else:
-            self.hint_label.pack_forget()
+            self.doctype_combo.pack_forget()
+            self.models_btn.pack_forget()
+            self.name_entry.pack(side="left", after=self.name_label)
+
+    def load_doc_types(self):
+        self.models = R.load_models()
+        names = [R.AUTO] + [m.name for m in self.models]
+        self.doctype_combo["values"] = names
+        if self.doctype_var.get() not in names:
+            self.doctype_var.set(R.AUTO)
+
+    def open_models(self):
+        ModelsDialog(self, on_saved=self.load_doc_types)
 
     def default_name(self):
         return "Digitalizacao_" + datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -762,8 +783,7 @@ class App(tk.Tk):
             "paper": self.paper_var.get(),
             "skip_blank": self.blank_var.get(),
             "auto_rotate": self.rotate_var.get(),
-            "read_text": (self.format_var.get() == FORMAT_SPLIT and R.uses_rt(self.template_var.get())
-                          and OCR_AVAILABLE),
+            "read_text": self.format_var.get() == FORMAT_SPLIT and OCR_AVAILABLE,
         }
         self.save_config()
         self.scanning = True
@@ -992,7 +1012,7 @@ class App(tk.Tk):
             self.tiles.pop(path).destroy()
             self.thumbs.pop(path, None)
             self.selected.discard(path)
-            R.forget_text(path)
+            R.forget_ocr(path)
             try:
                 os.remove(path)
             except OSError:
@@ -1077,6 +1097,7 @@ class App(tk.Tk):
         folder = filedialog.askdirectory(initialdir=self.folder_var.get() or None)
         if folder:
             self.folder_var.set(os.path.normpath(folder))
+            self.save_config()  # a próxima vez já abre nesta pasta
 
     def valid_folder(self):
         folder = self.folder_var.get().strip()
@@ -1185,46 +1206,45 @@ class App(tk.Tk):
             err, f"{len(pages)} página(s) salvas com sucesso em:\n{target}", folder))
 
     def save_split(self):
-        """Um PDF por página, com o nome montado pelo modelo (ex.: RECIBO DE INSUMO - RT {RT})."""
-        template = self.template_var.get().strip()
-        if not template:
-            messagebox.showwarning(APP_NAME, "Digite o modelo do nome dos arquivos.")
-            return
+        """Um PDF por página, com o nome montado pelo modelo do tipo de documento
+        (ex.: "RECIBO DE INSUMO - RT {RT}", "LIVRO ATA - {CAPS}")."""
         folder = self.valid_folder()
         if not folder:
             return
         self.save_config()
+        self.load_doc_types()
         pages = list(self.pages)
-        need_rt = R.uses_rt(template)
-        if need_rt and not OCR_AVAILABLE:
+        models = self.models
+        fixed = next((m for m in models if m.name == self.doctype_var.get()), None)
+        if not OCR_AVAILABLE:
             messagebox.showwarning(APP_NAME, "O reconhecimento de texto do Windows não está disponível.\n"
-                                             "Você poderá digitar os números na próxima tela.")
+                                             "Você poderá informar os dados na próxima tela.")
         done = [0]
 
         def read_all():
-            rts = []
+            rows = []
             for p in pages:
-                rt = None
-                if need_rt and OCR_AVAILABLE:
+                page = {"size": [0, 0], "lines": []}
+                if OCR_AVAILABLE:
                     try:
-                        rt = R.find_rt(R.page_text(p))
+                        page = R.page_ocr(p)
                     except Exception:
                         pass
-                rts.append(rt)
+                model = fixed or R.identify(R.ordered_text(page), models)
+                values = R.extract(model, page) if model else {}
+                rows.append({"path": p, "page": page, "model": model, "values": values})
                 done[0] += 1
-            return rts
+            return rows
 
-        def review(rts, error):
+        def review(rows, error):
             self.set_busy(False, "Confira os nomes dos arquivos.")
             if error:
                 messagebox.showerror(APP_NAME, f"Erro ao ler as páginas:\n{error}")
                 return
-            R.ReviewDialog(self, pages, rts, template, folder,
-                           lambda names: self.write_split(pages, names, folder))
+            ReviewDialog(self, rows, models, folder, lambda names: self.write_split(pages, names, folder))
 
-        self.set_busy(True, "Lendo o número da RT das páginas...")
-        self.run_background(read_all, review,
-                            lambda: f"Lendo o número da RT... {done[0]} de {len(pages)}")
+        self.set_busy(True, "Lendo as páginas...")
+        self.run_background(read_all, review, lambda: f"Lendo as páginas... {done[0]} de {len(pages)}")
 
     def write_split(self, pages, names, folder):
         def work():
@@ -1270,7 +1290,13 @@ def self_test():
         return {a: detect_rotation(page.rotate(a, expand=True)) for a in (0, 90, 180, 270)}
 
     check("rotacao", ocr)
-    check("leitura RT", lambda: [R.find_rt(t) for t in ("RT: 4521", "R.T. nº 0098", "PARTE 3")])
+    def models_check():
+        models = R.default_models()
+        samples = ["Kit de insumos\nRT: 4521", "02 livros ATA, destinados\nCAPS ....",
+                   "as chaves da Residência, no endereço: Rua A, 20 APT: 1- Centro - RJ,\nvinculada ao SRT", "PARTE 3"]
+        return [(m.name, R.extract_from_text(m, t)) if (m := R.identify(t, models)) else None for t in samples]
+
+    check("modelos", models_check)
 
     def pdf():
         import io

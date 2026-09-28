@@ -49,15 +49,47 @@ async def _recognize(img):
     return [w.text for line in result.lines for w in line.words]
 
 
-def read_text(img, max_size=2400):
-    """Texto da página (uma linha do OCR por linha). Vazio se o OCR não estiver disponível."""
+def read_lines(img, max_size=2400):
+    """Linhas de texto da página com a posição de cada uma, em pixels da imagem original:
+    {"size": [largura, altura], "lines": [{"text": ..., "box": [x, y, largura, altura]}]}"""
+    width, height = img.size
+    page = {"size": [width, height], "lines": []}
     if not OCR_AVAILABLE or _get_engine() is None:
-        return ""
+        return page
     gray = img.convert("L")
     limit = min(max_size, OcrEngine.max_image_dimension)
     gray.thumbnail((limit, limit))
+    scale = width / gray.width
     result = asyncio.run(_ocr(gray))
-    return "\n".join(line.text for line in result.lines)
+    for line in result.lines:
+        rects = [w.bounding_rect for w in line.words]
+        if not rects:
+            continue
+        x0 = min(r.x for r in rects)
+        y0 = min(r.y for r in rects)
+        x1 = max(r.x + r.width for r in rects)
+        y1 = max(r.y + r.height for r in rects)
+        page["lines"].append({"text": line.text,
+                              "box": [round(x0 * scale), round(y0 * scale),
+                                      round((x1 - x0) * scale), round((y1 - y0) * scale)]})
+    return page
+
+
+def ordered_text(page):
+    """Texto da página em ordem de leitura (de cima para baixo, da esquerda para a direita).
+    O OCR do Windows nem sempre devolve as linhas nessa ordem em textos justificados."""
+    lines = page.get("lines", [])
+    if not lines:
+        return ""
+    heights = sorted(l["box"][3] for l in lines)
+    band = max(8, heights[len(heights) // 2] * 0.6)
+    rows = sorted(lines, key=lambda l: (round((l["box"][1] + l["box"][3] / 2) / band), l["box"][0]))
+    return "\n".join(l["text"] for l in rows)
+
+
+def read_text(img, max_size=2400):
+    """Texto da página em ordem de leitura. Vazio se o OCR não estiver disponível."""
+    return ordered_text(read_lines(img, max_size))
 
 
 def _score(words):
